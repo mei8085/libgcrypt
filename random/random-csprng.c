@@ -84,6 +84,24 @@
 #error weird size for an unsigned long
 #endif
 
+/* Upper bound for the number of times a single request is replayed
+   because a fork was detected while it was served.  A fork is detected
+   at most once for a sane getpid(), so this is only a safety net
+   against a process which is forked in a tight loop or against a
+   broken getpid(); it must never let the replay turn into an endless
+   loop.  */
+#define MAX_FORK_RETRIES 10
+
+/* Return flags of read_pool() telling the caller where a fork was
+   detected.  FORK_SEEN_ENTRY means the pid changed before the pool was
+   read out (the ordinary "fork between two requests" case); the bytes
+   produced by this call are already derived from a freshly mixed pool
+   and are unique.  FORK_SEEN_EXIT means the pid changed after the pool
+   was read out, i.e. the bytes just produced may be identical to what
+   the parent process returned.  */
+#define FORK_SEEN_ENTRY  1
+#define FORK_SEEN_EXIT   2
+
 /* Contstants pertaining to the hash pool. */
 #define BLOCKLEN  64   /* Hash this amount of bytes... */
 #define DIGESTLEN 20   /* ... into a digest of this length (sha-1). */
@@ -200,12 +218,13 @@ static struct
   unsigned long ngetbytes2;
   unsigned long addbytes;
   unsigned long naddbytes;
+  unsigned long forkreplays;  /* Requests replayed after a fork was seen.  */
 } rndstats;
 
 
 
 /* ---  Prototypes  --- */
-static void read_pool (byte *buffer, size_t length, int level );
+static int read_pool (byte *buffer, size_t length, int level );
 static void add_randomness (const void *buffer, size_t length,
                             enum random_origins origin);
 static void random_poll (void);
@@ -357,11 +376,13 @@ _gcry_rngcsprng_dump_stats (void)
      into problems.  */
 
   log_info ("random usage: poolsize=%d mixed=%lu polls=%lu/%lu added=%lu/%lu\n"
-	    "              outmix=%lu getlvl1=%lu/%lu getlvl2=%lu/%lu%s\n",
+	    "              outmix=%lu getlvl1=%lu/%lu getlvl2=%lu/%lu"
+	    " forkreplays=%lu%s\n",
             POOLSIZE, rndstats.mixrnd, rndstats.slowpolls, rndstats.fastpolls,
             rndstats.naddbytes, rndstats.addbytes,
             rndstats.mixkey, rndstats.ngetbytes1, rndstats.getbytes1,
             rndstats.ngetbytes2, rndstats.getbytes2,
+            rndstats.forkreplays,
             _gcry_rndhw_failed_p()? " (hwrng failed)":"");
 }
 
@@ -449,6 +470,9 @@ _gcry_rngcsprng_randomize (void *buffer, size_t length,
                            enum gcry_random_level level)
 {
   unsigned char *p;
+  unsigned char *const start_buffer = buffer;
+  const size_t start_length = length;
+  int fork_retries = 0;
 
   /* Make sure we are initialized. */
   initialize ();
@@ -463,7 +487,8 @@ _gcry_rngcsprng_randomize (void *buffer, size_t length,
   /* Acquire the pool lock. */
   lock_pool ();
 
-  /* Update the statistics. */
+  /* Update the statistics.  This is done once for the logical request,
+     not for any replay within it. */
   if (level >= GCRY_VERY_STRONG_RANDOM)
     {
       rndstats.getbytes2 += length;
@@ -475,13 +500,46 @@ _gcry_rngcsprng_randomize (void *buffer, size_t length,
       rndstats.ngetbytes1++;
     }
 
+ replay:
   /* Read the random into the provided buffer. */
-  for (p = buffer; length > 0;)
+  for (p = start_buffer; length > 0;)
     {
       size_t n;
+      int fork_flags;
 
       n = length > POOLSIZE? POOLSIZE : length;
-      read_pool (p, n, level);
+      fork_flags = read_pool (p, n, level);
+      /* A fork that was detected only after the bytes were produced
+         (FORK_SEEN_EXIT) always forces a replay, because those bytes
+         may be identical to the parent's.  A fork detected at entry is
+         harmless for the first chunk: read_pool mixes in the child PID
+         before producing it, so the bytes are unique.  For a later
+         chunk however an earlier chunk was already produced from the
+         pre-fork pool state and may match the parent, so we must replay
+         the whole request as well.  */
+      if ((fork_flags & FORK_SEEN_EXIT)
+          || ((fork_flags & FORK_SEEN_ENTRY) && p != start_buffer))
+        {
+          /* Discard everything: the bytes already written into the
+             caller's buffer may be identical to what the parent process
+             returned.  Let read_pool mix in the child's PID on the next
+             call and replay the whole request from the start.  */
+          if (++fork_retries > MAX_FORK_RETRIES)
+            {
+              /* A single fork is resolved by a single replay.  Seeing a
+                 different PID over and over means that getpid() is
+                 broken or that we are being forked in a tight loop; in
+                 that situation we cannot guarantee unique output and
+                 fail like the DRBG backend does.  */
+              log_fatal ("severe error getting random after repeated "
+                         "fork detection\n");
+              return; /*NOTREACHED*/
+            }
+          memset (start_buffer, 0, start_length);
+          length = start_length;
+          rndstats.forkreplays++;
+          goto replay;
+        }
       length -= n;
       p += n;
     }
@@ -945,12 +1003,21 @@ _gcry_rngcsprng_update_seed_file (void)
    public random functions.  Note that Level GCRY_WEAK_RANDOM is not
    anymore handled special and in fact is an alias in the API for
    level GCRY_STRONG_RANDOM.  Must be called with the pool already
-   locked.  */
-static void
+   locked.
+
+   The function fills BUFFER with LENGTH bytes and returns a bitmask of
+   FORK_SEEN_* flags (0 if no fork was seen).  A fork detected before
+   the pool was read out (FORK_SEEN_ENTRY) is harmless: the returned
+   bytes are freshly mixed and unique, so the caller may use them.  A
+   fork detected after the pool was read out (FORK_SEEN_EXIT) means the
+   returned bytes may be identical to what the parent process produced;
+   the caller must discard them and replay the whole request.  */
+static int
 read_pool (byte *buffer, size_t length, int level)
 {
   int i;
   unsigned long *sp, *dp;
+  int fork_flags = 0;
   /* The volatile is there to make sure the compiler does not optimize
      the code away in case the getpid function is badly attributed.
      Note that we keep a pid in a static variable as well as in a
@@ -961,7 +1028,6 @@ read_pool (byte *buffer, size_t length, int level)
 
   gcry_assert (pool_is_locked);
 
- retry:
   /* Get our own pid, so that we can detect a fork. */
   my_pid2 = getpid ();
   if (my_pid == (pid_t)(-1))
@@ -969,13 +1035,18 @@ read_pool (byte *buffer, size_t length, int level)
   if ( my_pid != my_pid2 )
     {
       /* We detected a plain fork; i.e. we are now the child.  Update
-         the static pid and add some randomness. */
+         the static pid and add some randomness.  This is the ordinary
+         case of a fork between two requests: the bytes we are about to
+         create are derived from the freshly mixed pool and therefore
+         already differ from what the parent produces, so we can serve
+         the request in this very call (no replay needed). */
       pid_t x;
 
       my_pid = my_pid2;
       x = my_pid;
       add_randomness (&x, sizeof(x), RANDOM_ORIGIN_INIT);
       just_mixed = 0; /* Make sure it will get mixed. */
+      fork_flags |= FORK_SEEN_ENTRY;
     }
 
   gcry_assert (pool_is_locked);
@@ -1077,15 +1148,23 @@ read_pool (byte *buffer, size_t length, int level)
      the very same random number.  This test here is to detect forks
      in a multi-threaded process.  It does not work with all thread
      implementations in particular not with pthreads.  However it is
-     good enough for GNU Pth. */
+     good enough for GNU Pth.
+
+     We do not retry here: an immediate retry would spin the pool state
+     in place and, worse, would re-run the range check above with the
+     already consumed LENGTH.  Instead we report the fork to the caller
+     which then discards the (possibly parent-identical) bytes and
+     replays the whole request with a reseeded pool.  */
   if ( getpid () != my_pid2 )
     {
       pid_t x = getpid();
       add_randomness (&x, sizeof(x), RANDOM_ORIGIN_INIT);
       just_mixed = 0; /* Make sure it will get mixed. */
       my_pid = x;     /* Also update the static pid. */
-      goto retry;
+      fork_flags |= FORK_SEEN_EXIT;
     }
+
+  return fork_flags;
 }
 
 

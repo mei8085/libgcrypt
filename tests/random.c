@@ -29,6 +29,9 @@
 # include <signal.h>
 # include <sys/wait.h>
 #endif
+#ifdef HAVE_SYS_SYSCALL_H
+# include <sys/syscall.h>
+#endif
 
 #include "stopwatch.h"
 
@@ -198,6 +201,89 @@ check_forking (void)
   if (!memcmp (tmp1p, tmp1c, sizeof tmp1c))
     die ("parent and child got the same random number\n");
 #endif  /*!HAVE_W32_SYSTEM*/
+}
+
+
+/* Helper for check_fork_midcall: simulate a fork which is detected
+ * while a request is being served.  The libgcrypt code reads the PID
+ * once at the start and once at the end of the pool read-out; by
+ * letting the second getpid() of the next request return a different
+ * value we trigger exactly the "fork seen after the bytes were
+ * produced" path.
+ *
+ * Only compiled when we can interpose getpid() portably; see the
+ * guard in check_fork_midcall.
+ */
+#if !defined(HAVE_W32_SYSTEM) && defined(HAVE_SYS_SYSCALL_H) \
+    && defined(SYS_getpid)
+static int fork_midcall_armed;
+
+/* Default visibility is essential: the test is built with
+ * -fvisibility=hidden but the definition must interpose the call from
+ * the shared library.  */
+__attribute__((visibility("default")))
+pid_t
+getpid (void)
+{
+  pid_t real = (pid_t) syscall (SYS_getpid);
+
+  if (fork_midcall_armed)
+    {
+      fork_midcall_armed = 0;
+      return (pid_t) (real + 1);
+    }
+  return real;
+}
+#endif /* fork midcall interposer */
+
+
+/* Check that a fork detected in the middle of serving a request does
+ * not make the child abort (the old code re-ran the range check with
+ * the already consumed length) and that the child does not get the
+ * same bytes the parent produced.
+ */
+static void
+check_fork_midcall (void)
+{
+#if !defined(HAVE_W32_SYSTEM) && defined(HAVE_SYS_SYSCALL_H) \
+    && defined(SYS_getpid)
+  unsigned char pool[3*600];    /* spans several pool chunks */
+  unsigned char repl[3*600];
+  size_t i;
+
+  if (verbose)
+    info ("checking that a fork detected mid-request is handled\n");
+
+  /* Make sure the pool is initialized and warm.  Any value works.  */
+  gcry_randomize (repl, sizeof repl, GCRY_STRONG_RANDOM);
+
+  /* Now serve a request during which the fork is detected at the end
+     of the first pool read-out.  Before the fix this aborted with
+     "too many random bits requested"; now it must return cleanly.  */
+  fork_midcall_armed = 1;
+  memset (repl, 0, sizeof repl);
+  gcry_randomize (repl, sizeof repl, GCRY_STRONG_RANDOM);
+  fork_midcall_armed = 0;
+
+  /* The result must not be all zeroes (a budget check protects against
+     the replay clearing the caller buffer and then failing to refill
+     it).  */
+  for (i = 0; i < sizeof repl; i++)
+    if (repl[i])
+      break;
+  if (i == sizeof repl)
+    die ("random after mid-request fork is all zeroes\n");
+
+  /* Serve the same request again normally; the two results must not be
+     identical, which would indicate a state/seed collision after the
+     fork.  */
+  gcry_randomize (pool, sizeof pool, GCRY_STRONG_RANDOM);
+  if (!memcmp (pool, repl, sizeof pool))
+    die ("random after mid-request fork repeats a later request\n");
+#else
+  if (verbose)
+    info ("check_fork_midcall skipped: no getpid interposition\n");
+#endif
 }
 
 
@@ -789,6 +875,7 @@ main (int argc, char **argv)
   else if (!in_recursion)
     {
       check_forking ();
+      check_fork_midcall ();
       check_nonce_forking ();
       check_close_random_device ();
     }
