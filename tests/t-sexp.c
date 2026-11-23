@@ -1257,6 +1257,463 @@ static char thing[] =
 }
 
 
+/* Helper for the untrusted-input tests below: scan BUFFER/LENGTH and
+ * require that it fails with WANT_CODE.  The returned sexp handle must
+ * always be NULL on failure so that the caller never has to release a
+ * partially built object.  When WANT_OFF is not (size_t)-1 the error
+ * offset reported by the parser is checked as well.  */
+static void
+require_sscan_failure (const char *what, const char *buffer, size_t length,
+                       gpg_err_code_t want_code, size_t want_off)
+{
+  gcry_sexp_t sexp = NULL;
+  size_t erroff = (size_t)-2;
+  gpg_error_t err;
+
+  err = gcry_sexp_sscan (&sexp, &erroff, buffer, length);
+  if (!err)
+    {
+      fail ("%s: parsing unexpectedly succeeded (want error %d)\n",
+            what, want_code);
+      gcry_sexp_release (sexp);
+      return;
+    }
+  if (gpg_err_code (err) != want_code)
+    fail ("%s: expected error %d but got %d (%s)\n", what, want_code,
+          gpg_err_code (err), gpg_strerror (err));
+  if (sexp)
+    {
+      fail ("%s: parser returned a non-NULL sexp on error\n", what);
+      gcry_sexp_release (sexp);
+    }
+  if (want_off != (size_t)-1 && erroff != want_off)
+    fail ("%s: expected error offset %u but got %u\n", what,
+          (unsigned int)want_off, (unsigned int)erroff);
+}
+
+
+/* Build a balanced canonical expression nested DEPTH levels deep with
+ * a single leaf "1:x" and return it in a newly malloced buffer.  *R_LEN
+ * receives the number of valid bytes.  The shape is
+ * "((...(1:x)...))" with DEPTH opening and DEPTH closing parentheses.  */
+static char *
+make_nested_buffer (int depth, size_t *r_len)
+{
+  size_t len = (size_t)depth * 2 + 3;
+  char *buf = xmalloc (len + 1);
+  size_t pos;
+
+  memset (buf, '(', depth);
+  pos = depth;
+  memcpy (buf + pos, "1:x", 3);
+  pos += 3;
+  memset (buf + pos, ')', depth);
+  pos += depth;
+  buf[pos] = 0;
+  *r_len = pos;
+  return buf;
+}
+
+
+/* Feed the parser untrusted input whose nesting is either deeply
+ * nested but balanced or structurally broken.  The parser is iterative
+ * (it tracks the nesting level in an integer instead of recursing), so
+ * even very deep nesting must not exhaust the stack and must only use
+ * memory proportional to the supplied buffer.  Malformed nesting has to
+ * be reported with a distinguishable error and without leaking the
+ * partially built object.  */
+static void
+check_nesting (void)
+{
+  /* Depths at which the full node structure is walked with
+   * gcry_sexp_nth.  They stay well below 32767 because that accessor
+   * stores its scan level in a signed 16 bit counter.  */
+  static const int depths[] = { 1, 2, 16, 256, 1024, 10000 };
+  /* A depth beyond the accessor's 16 bit limit, used to prove that the
+   * parser itself stays iterative and bounded; this object is only
+   * inspected through gcry_sexp_sprint, never gcry_sexp_nth.  */
+  enum { DEEP_PARSE_DEPTH = 50000 };
+  int idx;
+  char *buf;
+  size_t len;
+  gcry_sexp_t sexp;
+  gpg_error_t err;
+
+  info ("checking nested expressions from untrusted input\n");
+
+  /* A legal, deeply nested expression keeps its full node structure:
+   * walking DEPTH car steps must reach the single leaf and the leaf
+   * must contain exactly the bytes "x".  */
+  for (idx = 0; idx < DIM (depths); idx++)
+    {
+      int depth = depths[idx];
+      int level;
+      gcry_sexp_t cur, inner;
+      size_t datalen;
+      const char *data;
+
+      buf = make_nested_buffer (depth, &len);
+      sexp = NULL;
+      err = gcry_sexp_sscan (&sexp, NULL, buf, len);
+      if (err)
+        {
+          fail ("depth %d: legal nested expression rejected: %s\n",
+                depth, gpg_strerror (err));
+          xfree (buf);
+          continue;
+        }
+
+      cur = sexp;
+      for (level = 0; level < depth; level++)
+        {
+          /* gcry_sexp_nth returns a freshly allocated copy, so each
+           * intermediate node has to be released after descending.  */
+          inner = gcry_sexp_nth (cur, 0);
+          if (cur != sexp)
+            gcry_sexp_release (cur);
+          if (!inner)
+            {
+              fail ("depth %d: node structure broken at level %d\n",
+                    depth, level);
+              cur = NULL;
+              break;
+            }
+          cur = inner;
+        }
+      if (cur && level == depth)
+        {
+          data = gcry_sexp_nth_data (cur, 0, &datalen);
+          if (!data || datalen != 1 || data[0] != 'x')
+            fail ("depth %d: leaf node content not preserved\n", depth);
+        }
+      if (cur && cur != sexp)
+        gcry_sexp_release (cur);
+      gcry_sexp_release (sexp);
+      xfree (buf);
+    }
+
+  /* Parser stack/heap boundedness: an input nested far beyond any
+   * recursion limit must still parse without growing resources beyond
+   * the size of the input, and round trip through the canonical writer.
+   * No gcry_sexp_nth walk is done here on purpose (see above).  */
+  buf = make_nested_buffer (DEEP_PARSE_DEPTH, &len);
+  sexp = NULL;
+  err = gcry_sexp_sscan (&sexp, NULL, buf, len);
+  if (err)
+    fail ("deep parse: expression nested %d levels rejected: %s\n",
+          DEEP_PARSE_DEPTH, gpg_strerror (err));
+  else
+    {
+      size_t canonlen = gcry_sexp_sprint (sexp, GCRYSEXP_FMT_CANON,
+                                          NULL, 0);
+      /* The canonical encoding is the input plus one trailing NUL.  */
+      if (!canonlen || canonlen > len + 1)
+        fail ("deep parse: output size %u not bounded by input %u\n",
+              (unsigned int)canonlen, (unsigned int)len);
+    }
+  gcry_sexp_release (sexp);
+  xfree (buf);
+
+  /* The same deep input with one closing parenthesis removed is
+   * rejected rather than parsed: structural errors stay detectable at
+   * depth and no object is returned.  */
+  buf = make_nested_buffer (DEEP_PARSE_DEPTH, &len);
+  buf[--len] = 0;
+  require_sscan_failure ("unbalanced deep expression", buf, len,
+                         GPG_ERR_SEXP_UNMATCHED_PAREN, (size_t)-1);
+  xfree (buf);
+
+  /* A closing parenthesis without an opener is rejected immediately.  */
+  require_sscan_failure ("stray closing parenthesis", "(1:x))", 6,
+                         GPG_ERR_SEXP_UNMATCHED_PAREN, 5);
+
+  /* Empty and half-open buffers never produce a sexp object.  */
+  require_sscan_failure ("only open parenthesis", "(", 1,
+                         GPG_ERR_SEXP_UNMATCHED_PAREN, (size_t)-1);
+}
+
+
+/* Exercise explicit length declarations ("N:data") on untrusted
+ * buffers.  A declared length that runs past the end of the buffer, an
+ * invalid length specification and a leading zero each have their own
+ * error code, and in every failure case the parser must not allocate
+ * memory based on the (attacker controlled) declared length.  */
+static void
+check_length_decl (void)
+{
+  static struct
+  {
+    const char *text;
+    size_t length;
+    gpg_err_code_t errcode;
+    size_t erroff;       /* (size_t)-1 means: do not check the offset */
+  } bad[] =
+    {
+      /* Declared 10 bytes but only 2 follow: truncated content.  */
+      { "(10:ab)",          7, GPG_ERR_SEXP_STRING_TOO_LONG, 3 },
+      /* Length prefix present, colon missing before the buffer ends.  */
+      { "(3:",              3, GPG_ERR_SEXP_STRING_TOO_LONG, 2 },
+      /* Declared payload but the buffer ends right after the colon.  */
+      { "(1:",              3, GPG_ERR_SEXP_STRING_TOO_LONG, 2 },
+      /* A length has to be followed by a colon.  */
+      { "(3ax)",            5, GPG_ERR_SEXP_INV_LEN_SPEC,    2 },
+      /* Lengths may not start with a zero.  */
+      { "(01:x)",           6, GPG_ERR_SEXP_ZERO_PREFIX,     1 },
+      /* A length beyond the 65535 byte DATALEN limit is invalid.  */
+      { "(65536:x)",        9, GPG_ERR_INV_ARG,              6 },
+      /* Huge declared length with a tiny buffer: the parser must only
+       * touch the bytes actually present and never try to reserve the
+       * declared amount of memory.  */
+      { "(999999999:ab)",  14, GPG_ERR_INV_ARG,             10 },
+    };
+  static const char *good[] =
+    {
+      "(1:x)",
+      "(3:abc)",
+      "(5:a\"b\\c)",          /* quote and backslash are plain data here */
+      "(2:ab(1:x))",
+    };
+  int idx;
+  gcry_sexp_t sexp;
+  gpg_error_t err;
+  size_t datalen;
+  const char *data;
+
+  info ("checking length declarations on untrusted input\n");
+
+  for (idx = 0; idx < DIM (bad); idx++)
+    require_sscan_failure ("bad length declaration", bad[idx].text,
+                           bad[idx].length, bad[idx].errcode,
+                           bad[idx].erroff);
+
+  /* Well formed declarations parse and preserve exactly the declared
+   * number of bytes, including non-token bytes.  */
+  for (idx = 0; idx < DIM (good); idx++)
+    {
+      sexp = NULL;
+      err = gcry_sexp_sscan (&sexp, NULL, good[idx], strlen (good[idx]));
+      if (err)
+        {
+          fail ("good declaration %d rejected: %s\n", idx,
+                gpg_strerror (err));
+          continue;
+        }
+      data = gcry_sexp_nth_data (sexp, 0, &datalen);
+      if (!data)
+        fail ("good declaration %d: no data node returned\n", idx);
+      else if (good[idx][1] != ':'
+               && datalen != (size_t)(good[idx][1] - '0'))
+        fail ("good declaration %d: node length %u does not match\n",
+              idx, (unsigned int)datalen);
+      gcry_sexp_release (sexp);
+    }
+
+  /* The canonical length scanner has to apply the same bounded checks:
+   * it scans at most LENGTH bytes and reports distinguishable codes.  */
+  {
+    static struct
+    {
+      const char *text;
+      size_t length;
+      gpg_err_code_t errcode;
+    } canon_bad[] =
+      {
+        { "(10:abc)", 8, GPG_ERR_SEXP_STRING_TOO_LONG },
+        { "(1:)",     4, GPG_ERR_SEXP_STRING_TOO_LONG },
+        { "(01:x)",   6, GPG_ERR_SEXP_ZERO_PREFIX     },
+        { "(3ax)",    5, GPG_ERR_SEXP_INV_LEN_SPEC    },
+        { "(()",      3, GPG_ERR_SEXP_STRING_TOO_LONG },
+        { "( )",      3, GPG_ERR_SEXP_BAD_CHARACTER   },
+        { "1:x",      3, GPG_ERR_SEXP_NOT_CANONICAL   },
+      };
+    gpg_err_code_t ec;
+    size_t eo, n;
+
+    for (idx = 0; idx < DIM (canon_bad); idx++)
+      {
+        ec = 0;
+        eo = 0;
+        n = gcry_sexp_canon_len ((const unsigned char *)canon_bad[idx].text,
+                                 canon_bad[idx].length, &eo, &ec);
+        if (n || gpg_err_code (ec) != canon_bad[idx].errcode)
+          fail ("canon_len case %d: got n=%u err=%d (%s), want err=%d\n",
+                idx, (unsigned int)n, gpg_err_code (ec),
+                gpg_strerror (ec), canon_bad[idx].errcode);
+      }
+  }
+}
+
+
+/* Check quoted strings and their escape sequences.  All bytes produced
+ * by an escape sequence have to end up in the single data node of the
+ * quoted string; malformed or truncated escapes are rejected with
+ * GPG_ERR_SEXP_BAD_QUOTATION before any node is returned.  */
+static void
+check_quoting (void)
+{
+  static struct
+  {
+    const char *text;
+    const unsigned char *expect;
+    size_t expect_len;
+  } good[] =
+    {
+      /* Simple single-character escapes.  */
+      { "(\"\\b\\t\\v\\n\\f\\r\\\"\\'\\\\\")",
+        (const unsigned char *)"\b\t\v\n\f\r\"'\\", 9 },
+      /* Hexadecimal and octal escapes, also at the end of the buffer.  */
+      { "(\"\\x41\\101\")",
+        (const unsigned char *)"AA", 2 },
+      /* Escaped quote and backslash stay inside the node.  */
+      { "(\"a\\\"b\")",
+        (const unsigned char *)"a\"b", 3 },
+      /* Line continuations swallow the CR/LF pair.  */
+      { "(\"a\\\r\nb\")",
+        (const unsigned char *)"ab", 2 },
+      { "(\"a\\\n\rb\")",
+        (const unsigned char *)"ab", 2 },
+    };
+  static struct
+  {
+    const char *text;
+    size_t length;
+  } bad[] =
+    {
+      { "(\"\\q\")",   6 },  /* Unknown escape character.  */
+      { "(\"\\x4\")",  7 },  /* Truncated hexadecimal escape.  */
+      { "(\"\\xg\")",  7 },  /* Non hex digit in hex escape.  */
+      { "(\"\\7\")",   6 },  /* Truncated octal escape.  */
+    };
+  int idx;
+  gcry_sexp_t sexp;
+  gpg_error_t err;
+
+  info ("checking quoted strings and escape boundaries\n");
+
+  for (idx = 0; idx < DIM (good); idx++)
+    {
+      size_t datalen;
+      const char *data;
+
+      sexp = NULL;
+      err = gcry_sexp_sscan (&sexp, NULL, good[idx].text,
+                             strlen (good[idx].text));
+      if (err)
+        {
+          fail ("good quoting %d rejected: %s\n", idx, gpg_strerror (err));
+          continue;
+        }
+      /* Everything must land in exactly one node.  */
+      if (gcry_sexp_length (sexp) != 1)
+        fail ("good quoting %d: expected a single node, got %d\n",
+              idx, gcry_sexp_length (sexp));
+      data = gcry_sexp_nth_data (sexp, 0, &datalen);
+      if (!data)
+        fail ("good quoting %d: no data node\n", idx);
+      else if (datalen != good[idx].expect_len
+               || memcmp (data, good[idx].expect, datalen))
+        {
+          size_t i;
+
+          fail ("good quoting %d: unquoted content mismatch "
+                "(got %u bytes)\n", idx, (unsigned int)datalen);
+          for (i = 0; i < datalen; i++)
+            fprintf (stderr, "  got[%u]=0x%02x\n", (unsigned int)i,
+                     (unsigned char)data[i]);
+        }
+      gcry_sexp_release (sexp);
+    }
+
+  for (idx = 0; idx < DIM (bad); idx++)
+    require_sscan_failure ("bad quoting", bad[idx].text, bad[idx].length,
+                           GPG_ERR_SEXP_BAD_QUOTATION, (size_t)-1);
+
+  /* Two adjacent quoted strings produce two separate nodes: escape
+   * handling must never merge data across node boundaries.  */
+  sexp = NULL;
+  err = gcry_sexp_sscan (&sexp, NULL, "(\"x\" \"y\")", 9);
+  if (err)
+    fail ("two quoted nodes rejected: %s\n", gpg_strerror (err));
+  else
+    {
+      size_t n0, n1;
+      const char *d0 = gcry_sexp_nth_data (sexp, 0, &n0);
+      const char *d1 = gcry_sexp_nth_data (sexp, 1, &n1);
+
+      if (gcry_sexp_length (sexp) != 2 || !d0 || !d1
+          || n0 != 1 || d0[0] != 'x' || n1 != 1 || d1[0] != 'y')
+        fail ("two quoted nodes: node structure not preserved\n");
+    }
+  gcry_sexp_release (sexp);
+}
+
+
+/* After a failed parse the parser object/state must remain usable:
+ * every call gets a fresh output handle, a failure leaves it NULL, and
+ * subsequent calls on the same thread parse independent input
+ * correctly.  This is run repeatedly so that resource leaks show up
+ * under malloc debugging or sanitizers.  */
+static void
+check_parser_recovery (void)
+{
+  static struct
+  {
+    const char *text;
+    gpg_err_code_t errcode;
+  } bad[] =
+    {
+      { "(10:ab)",  GPG_ERR_SEXP_STRING_TOO_LONG },
+      { "(01:x)",   GPG_ERR_SEXP_ZERO_PREFIX     },
+      { "(3ax)",    GPG_ERR_SEXP_INV_LEN_SPEC    },
+      { "((1:x)",   GPG_ERR_SEXP_UNMATCHED_PAREN },
+      { "(\"\\q\")",GPG_ERR_SEXP_BAD_QUOTATION   },
+    };
+  static const char *good = "(2:ok)";
+  int round, idx;
+  gcry_sexp_t sexp;
+  gpg_error_t err;
+  size_t datalen;
+  const char *data;
+
+  info ("checking parser recovery after untrusted-input failures\n");
+
+  for (round = 0; round < 32; round++)
+    {
+      for (idx = 0; idx < DIM (bad); idx++)
+        {
+          sexp = NULL;
+          err = gcry_sexp_sscan (&sexp, NULL, bad[idx].text,
+                                 strlen (bad[idx].text));
+          if (gpg_err_code (err) != bad[idx].errcode)
+            fail ("recovery round %d case %d: expected %d got %d (%s)\n",
+                  round, idx, bad[idx].errcode, gpg_err_code (err),
+                  gpg_strerror (err));
+          if (sexp)
+            {
+              fail ("recovery round %d case %d: non-NULL handle on error\n",
+                    round, idx);
+              gcry_sexp_release (sexp);
+            }
+
+          /* The very next call must work on unrelated input.  */
+          sexp = NULL;
+          err = gcry_sexp_sscan (&sexp, NULL, good, strlen (good));
+          if (err)
+            fail ("recovery round %d case %d: follow-up parse failed: %s\n",
+                  round, idx, gpg_strerror (err));
+          else
+            {
+              data = gcry_sexp_nth_data (sexp, 0, &datalen);
+              if (!data || datalen != 2 || memcmp (data, "ok", 2))
+                fail ("recovery round %d case %d: follow-up data wrong\n",
+                      round, idx);
+              gcry_sexp_release (sexp);
+            }
+        }
+    }
+}
+
+
 int
 main (int argc, char **argv)
 {
@@ -1337,6 +1794,10 @@ main (int argc, char **argv)
       check_sscan ();
       check_extract_param ();
       bug_1594 ();
+      check_nesting ();
+      check_length_decl ();
+      check_quoting ();
+      check_parser_recovery ();
     }
   while (!error_count && loop--);
 
