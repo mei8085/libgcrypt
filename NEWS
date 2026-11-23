@@ -3,6 +3,16 @@ Noteworthy changes in version 1.12.4 (unreleased)  [C28/A8/R_]
 
  * Bug fixes:
 
+   - Fix MPI zero handling and serialization length boundaries.  A zero
+     is now reported the same way regardless of how it was constructed
+     (including zeroes carrying unused limbs or a leftover sign bit), an
+     opaque MPI with zero length behaves as an empty value, and
+     gcry_mpi_scan/gcry_mpi_print apply their length limits and error
+     reporting consistently.  An opaque MPI created without data or
+     with an out of range bit count is refused instead of being stored
+     broken, and set/copy/snatch no longer mix opaque payloads with limb
+     arrays.
+
 
  Release-info: https://dev.gnupg.org/T8414
 

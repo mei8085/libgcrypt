@@ -5280,6 +5280,12 @@ change the value stored at @var{w}.  Note that this function returns
 an @code{unsigned int} so that this value can immediately be used with
 the bit test functions.  This is in contrast to the other "_ui"
 functions which allow for values up to an @code{unsigned long}.
+
+The value is judged by its numeric value, not by its internal
+representation: a zero, including one with a leftover sign bit or with
+unused zero limbs, is accepted and yields @code{0}, exactly like a
+plain zero.  An opaque MPI (see @code{gcry_mpi_set_opaque}) is not an
+integer and is always rejected with @code{GPG_ERR_ERANGE}.
 @end deftypefun
 
 
@@ -5353,6 +5359,18 @@ Simple unsigned integer.
 Note that all of the above formats store the integer in big-endian
 format (MSB first).  Leading zeroes are stripped unless they are
 required to keep a value positive.
+
+If a value cannot be represented in the requested format, or if the
+input is truncated, the function fails and no value is returned:
+@var{r_mpi} is set to @code{NULL} and @var{nscanned} is set to zero.
+A missing @var{buffer} is reported as @code{GPG_ERR_INV_ARG} unless an
+empty value is requested, in which case the empty value is returned.
+An input which is too short for the format is reported as
+@code{GPG_ERR_TOO_SHORT}; a length header which claims more data than
+@var{buflen} provides is reported as @code{GPG_ERR_TOO_LARGE}; other
+malformed input, including the format specific size limits, is
+reported as @code{GPG_ERR_INV_OBJ}.  On failure no partial value is
+retained.
 @end deftypefun
 
 
@@ -5362,7 +5380,16 @@ Convert the MPI @var{a} into an external representation described by
 @var{format} (see above) and store it in the provided @var{buffer}
 which has a usable length of at least @var{buflen} bytes. If
 @var{nwritten} is not @code{NULL}, it will receive the number of bytes
-actually stored in @var{buffer} after a successful operation.
+actually stored in @var{buffer} after a successful operation.  If
+@var{buffer} is @code{NULL} the required length is returned in
+@var{nwritten} without storing anything.
+
+If the provided buffer is too short @code{GPG_ERR_TOO_SHORT} is
+returned; if the value cannot be represented in the requested format
+(for example a value beyond the PGP bit limit or a negative value in
+an unsigned format) @code{GPG_ERR_TOO_LARGE} or @code{GPG_ERR_INV_ARG}
+is returned respectively.  On failure @var{nwritten} is set to zero and
+no output is produced.
 @end deftypefun
 
 @deftypefun gcry_error_t gcry_mpi_aprint (@w{enum gcry_mpi_format @var{format}}, @w{unsigned char **@var{buffer}}, @w{size_t *@var{nbytes}}, @w{const gcry_mpi_t @var{a}})
@@ -5805,12 +5832,20 @@ that @code{gcry_free} is able to release it.
 WARNING: Never use an opaque MPI for actual math operations.  The only
 valid functions are @code{gcry_mpi_get_opaque} and @code{gcry_mpi_release}.  Use
 @code{gcry_mpi_scan} to convert a string of arbitrary bytes into an MPI.
+
+A zero @var{nbits} stores an empty value; in that case @var{p} may be
+@code{NULL}.  If @var{nbits} is non-zero, @var{p} must not be
+@code{NULL} and @var{nbits} must be representable as a signed
+@code{int}.  A value which violates these rules is refused: when
+@var{a} is @code{NULL} the function returns @code{NULL}, otherwise
+@var{a} is returned unchanged.
 @end deftypefun
 
 @deftypefun gcry_mpi_t gcry_mpi_set_opaque_copy (@w{gcry_mpi_t @var{a}}, @w{const void *@var{p}}, @w{unsigned int @var{nbits}})
 
 Same as @code{gcry_mpi_set_opaque} but ownership of @var{p} is not
-taken; instead a copy of @var{p} is used.
+taken; instead a copy of @var{p} is used.  An empty value (@var{nbits}
+of zero) copies nothing and needs no data.
 @end deftypefun
 
 
@@ -5819,7 +5854,8 @@ taken; instead a copy of @var{p} is used.
 Return a pointer to an opaque value stored in @var{a} and return its
 size in @var{nbits}.  Note that the returned pointer is still owned by
 @var{a} and that the function should never be used for an non-opaque
-MPI.
+MPI.  For an empty opaque value (zero bits) @code{NULL} is returned
+and @var{nbits} is set to zero.
 @end deftypefun
 
 Each MPI has an associated set of flags for special purposes.  The

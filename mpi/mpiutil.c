@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #include "g10lib.h"
 #include "mpi-internal.h"
@@ -268,14 +269,39 @@ mpi_set_secure( gcry_mpi_t a )
   if ( (a->flags & GCRYMPI_FLAG_SECURE) )
     return;
   a->flags |= GCRYMPI_FLAG_SECURE;
+
+  if ( (a->flags & GCRYMPI_FLAG_OPAQUE) )
+    {
+      /* Move the opaque payload into secure memory.  A zero length
+         value has no payload, and a payload which is already held in
+         secure memory is kept as is.  */
+      size_t nbytes = (a->sign > 0) ? ((size_t)a->sign + 7) / 8 : 0;
+
+      if (a->d && nbytes && !_gcry_is_secure (a->d))
+        {
+          void *sp = xmalloc_secure (nbytes);
+
+          memcpy (sp, a->d, nbytes);
+          xfree (a->d);
+          a->d = sp;
+        }
+      return;
+    }
+
   ap = a->d;
-  if (!a->nlimbs)
+  if (!a->alloced)
     {
       gcry_assert (!ap);
       return;
     }
+
+  /* Even a value which currently has no significant limbs (that is, a
+     zero) may own limb space; migrate that space as well so that the
+     state transition does not depend on whether the value happens to
+     be normalized.  */
   bp = mpi_alloc_limb_space (a->alloced, 1);
-  MPN_COPY( bp, ap, a->nlimbs );
+  if (a->nlimbs)
+    MPN_COPY( bp, ap, a->nlimbs );
   a->d = bp;
   _gcry_mpi_free_limb_space (ap, a->alloced);
 }
@@ -284,8 +310,13 @@ mpi_set_secure( gcry_mpi_t a )
 gcry_mpi_t
 _gcry_mpi_set_opaque (gcry_mpi_t a, void *p, unsigned int nbits)
 {
+  int allocated = 0;
+
   if (!a)
-    a = mpi_alloc(0);
+    {
+      a = mpi_alloc(0);
+      allocated = 1;
+    }
 
   if (mpi_is_immutable (a))
     {
@@ -293,8 +324,31 @@ _gcry_mpi_set_opaque (gcry_mpi_t a, void *p, unsigned int nbits)
       return a;
     }
 
+  /* A zero bit length denotes an empty octet string: there is nothing
+     to store and the payload pointer is thus not dereferenced.  For
+     any other length the payload must be given.  The bit length is
+     kept in a signed int (see struct gcry_mpi) and thus must fit into
+     it as well.  */
+  if ((nbits && !p) || nbits > (unsigned int)INT_MAX)
+    {
+      log_info ("Warning: invalid opaque MPI value\n");
+      /* Ownership of P was transferred to us; release it unless it is
+         the value A already holds.  */
+      if (p && p != a->d)
+        xfree (p);
+      if (allocated)
+        {
+          _gcry_mpi_free (a);
+          return NULL;
+	}
+      return a;
+    }
+
   if ((a->flags & GCRYMPI_FLAG_OPAQUE))
-    xfree (a->d);
+    {
+      if (a->d && a->d != p)
+        xfree (a->d);
+    }
   else
     _gcry_mpi_free_limb_space (a->d, a->alloced);
 
@@ -316,13 +370,26 @@ gcry_mpi_t
 _gcry_mpi_set_opaque_copy (gcry_mpi_t a, const void *p, unsigned int nbits)
 {
   void *d;
-  unsigned int n;
+  size_t n;
 
-  n = (nbits+7)/8;
-  d = _gcry_is_secure (p)? xtrymalloc_secure (n) : xtrymalloc (n);
-  if (!d)
-    return NULL;
-  memcpy (d, p, n);
+  if ((nbits && !p) || nbits > (unsigned int)INT_MAX)
+    {
+      log_info ("Warning: invalid opaque MPI value\n");
+      if (!a)
+        return NULL;
+      return a;
+    }
+
+  n = ((size_t)nbits + 7) / 8;
+  if (!n)
+    d = NULL;
+  else
+    {
+      d = _gcry_is_secure (p)? xtrymalloc_secure (n) : xtrymalloc (n);
+      if (!d)
+        return NULL;
+      memcpy (d, p, n);
+    }
   return mpi_set_opaque (a, d, nbits);
 }
 
@@ -343,12 +410,17 @@ _gcry_mpi_get_opaque_copy (gcry_mpi_t a, unsigned int *nbits)
 {
   const void *s;
   void *d;
-  unsigned int n;
+  size_t n;
+  unsigned int nb;
 
-  s = mpi_get_opaque (a, nbits);
-  if (!s && nbits)
+  s = mpi_get_opaque (a, &nb);
+  if (nbits)
+    *nbits = nb;
+  if (!s)
     return NULL;
-  n = (*nbits+7)/8;
+  n = ((size_t)nb + 7) / 8;
+  if (!n)
+    return NULL;
   d = _gcry_is_secure (s)? xtrymalloc_secure (n) : xtrymalloc (n);
   if (d)
     memcpy (d, s, n);
@@ -367,11 +439,13 @@ _gcry_mpi_copy (gcry_mpi_t a)
 
     if( a && (a->flags & GCRYMPI_FLAG_OPAQUE) ) {
         void *p = NULL;
-        if (a->sign) {
-            p = _gcry_is_secure(a->d)? xmalloc_secure ((a->sign+7)/8)
-                                     : xmalloc ((a->sign+7)/8);
+        size_t n = (a->sign > 0) ? ((size_t)a->sign + 7) / 8 : 0;
+        if (n) {
+            p = _gcry_is_secure(a->d)? xmalloc_secure (n) : xmalloc (n);
             if (a->d)
-                memcpy( p, a->d, (a->sign+7)/8 );
+                memcpy( p, a->d, n );
+            else
+                memset( p, 0, n );
         }
         b = mpi_set_opaque( NULL, p, a->sign );
         b->flags = a->flags;
@@ -445,10 +519,20 @@ _gcry_mpi_alloc_like( gcry_mpi_t a )
     gcry_mpi_t b;
 
     if( a && (a->flags & GCRYMPI_FLAG_OPAQUE) ) {
-	int n = (a->sign+7)/8;
-	void *p = _gcry_is_secure(a->d)? xtrymalloc_secure (n)
-                                       : xtrymalloc (n);
-	memcpy( p, a->d, n );
+	size_t n = (a->sign > 0) ? ((size_t)a->sign + 7) / 8 : 0;
+	void *p = NULL;
+
+	if (n)
+	  {
+	    p = _gcry_is_secure(a->d)? xtrymalloc_secure (n)
+	                             : xtrymalloc (n);
+	    if (!p)
+	      return NULL;
+	    if (a->d)
+	      memcpy (p, a->d, n);
+	    else
+	      memset (p, 0, n);
+	  }
 	b = mpi_set_opaque( NULL, p, a->sign );
     }
     else if( a ) {
@@ -475,13 +559,40 @@ _gcry_mpi_snatch (gcry_mpi_t w, gcry_mpi_t u)
           mpi_immutable_failed ();
           return;
         }
-      _gcry_mpi_assign_limb_space (w, u->d, u->alloced);
-      w->nlimbs = u->nlimbs;
-      w->sign   = u->sign;
-      w->flags  = u->flags;
-      u->alloced = 0;
-      u->nlimbs = 0;
-      u->d = NULL;
+      if ((w->flags & GCRYMPI_FLAG_OPAQUE)
+          || (u->flags & GCRYMPI_FLAG_OPAQUE))
+        {
+          /* Opaque payloads and limb arrays must not be mixed.  Take
+             an independent copy of U's value and adopt it in W.  */
+          gcry_mpi_t tmp = _gcry_mpi_copy (u);
+
+          if ((w->flags & GCRYMPI_FLAG_OPAQUE))
+            {
+              if (w->d && w->d != tmp->d)
+                xfree (w->d);
+            }
+          else
+            _gcry_mpi_free_limb_space (w->d, w->alloced);
+          w->d = tmp->d;
+          w->alloced = tmp->alloced;
+          w->nlimbs = tmp->nlimbs;
+          w->sign = tmp->sign;
+          w->flags = tmp->flags;
+          tmp->d = NULL;
+          tmp->nlimbs = 0;
+          tmp->alloced = 0;
+          _gcry_mpi_free (tmp);
+        }
+      else
+        {
+          _gcry_mpi_assign_limb_space (w, u->d, u->alloced);
+          w->nlimbs = u->nlimbs;
+          w->sign   = u->sign;
+          w->flags  = u->flags;
+          u->alloced = 0;
+          u->nlimbs = 0;
+          u->d = NULL;
+        }
     }
   _gcry_mpi_free (u);
 }
@@ -495,12 +606,49 @@ _gcry_mpi_set (gcry_mpi_t w, gcry_mpi_t u)
   int usign = u->sign;
 
   if (!w)
-    w = _gcry_mpi_alloc( mpi_get_nlimbs(u) );
+    {
+      /* Without a destination we can only hand out a copy.  Opaque
+         values must be copied opaquely as well.  */
+      if (u->flags & GCRYMPI_FLAG_OPAQUE)
+        return _gcry_mpi_copy (u);
+      w = _gcry_mpi_alloc( mpi_get_nlimbs(u) );
+    }
   if (mpi_is_immutable (w))
     {
       mpi_immutable_failed ();
       return w;
     }
+
+  if ((u->flags & GCRYMPI_FLAG_OPAQUE)
+      || (w->flags & GCRYMPI_FLAG_OPAQUE))
+    {
+      /* At least one side holds an opaque octet string.  Copy the
+         value transparently so that the destination representation
+         matches the source.  */
+      gcry_mpi_t tmp = _gcry_mpi_copy (u);
+
+      if (!tmp)
+        return w;
+      if (w->flags & GCRYMPI_FLAG_OPAQUE)
+        {
+          if (w->d && w->d != tmp->d)
+            xfree (w->d);
+        }
+      else
+        _gcry_mpi_free_limb_space (w->d, w->alloced);
+      w->d = tmp->d;
+      w->alloced = tmp->alloced;
+      w->nlimbs = tmp->nlimbs;
+      w->sign = tmp->sign;
+      w->flags = tmp->flags;
+      w->flags &= ~(GCRYMPI_FLAG_IMMUTABLE|GCRYMPI_FLAG_CONST);
+      tmp->d = NULL;
+      tmp->nlimbs = 0;
+      tmp->alloced = 0;
+      _gcry_mpi_free (tmp);
+      return w;
+    }
+
   RESIZE_IF_NEEDED(w, usize);
   wp = w->d;
   up = u->d;
@@ -583,10 +731,33 @@ _gcry_mpi_get_ui (unsigned int *w, gcry_mpi_t u)
 {
   mpi_limb_t x;
 
+  /* Normalize first so that a value which carries leading zero limbs
+     (for example a zero built by clearing a high bit) is judged by its
+     numeric value and not by its limb representation.  This makes the
+     result independent of the order in which the value was
+     constructed.  */
+  _gcry_mpi_normalize (u);
+
+  /* Only integers have an unsigned integer value.  An opaque octet
+     string is not an integer and is rejected consistently; the test
+     is done on the normalized value so a zero length opaque value is
+     not mistaken for the number zero.  */
+  if (mpi_is_opaque (u))
+    return GPG_ERR_ERANGE;
+
+  /* An MPI without significant limbs is zero; a leftover sign bit (a
+     "negative zero") must not make it look out of range.  This is the
+     same rule used when printing.  */
+  if (u->nlimbs == 0)
+    {
+      *w = 0;
+      return 0;
+    }
+
   if (u->nlimbs > 1 || u->sign)
     return GPG_ERR_ERANGE;
 
-  x = (u->nlimbs == 1) ? u->d[0] : 0;
+  x = u->d[0];
   if (sizeof (x) > sizeof (unsigned int) && x > MY_UINT_MAX)
     return GPG_ERR_ERANGE;
 

@@ -266,6 +266,328 @@ test_maxsize (void)
 }
 
 
+/* Check that a zero value is treated the same regardless of how it was
+ * constructed and that an opaque value with a zero bit length behaves
+ * the same as a numeric zero where the public interface allows.  */
+static void
+test_zero_normalization (void)
+{
+  gcry_mpi_t a, b;
+  unsigned int val;
+  gpg_error_t err;
+  unsigned char *buf;
+  size_t n;
+
+  /* A plain zero.  */
+  a = gcry_mpi_set_ui (NULL, 0);
+  val = 4711;
+  err = gcry_mpi_get_ui (&val, a);
+  if (err || val != 0)
+    die ("get_ui on zero failed at %d: %s\n", __LINE__, gpg_strerror (err));
+  gcry_mpi_release (a);
+
+  /* A zero carrying allocated but insignificant limbs, built by
+   * setting and then clearing a high bit.  The result must not depend
+   * on the limb representation.  */
+  a = gcry_mpi_set_ui (NULL, 0);
+  gcry_mpi_set_bit (a, 129);
+  gcry_mpi_clear_bit (a, 129);
+  val = 4711;
+  err = gcry_mpi_get_ui (&val, a);
+  if (err || val != 0)
+    die ("get_ui on unnormalized zero failed at %d: %s\n",
+         __LINE__, gpg_strerror (err));
+  if (gcry_mpi_cmp_ui (a, 0))
+    die ("unnormalized zero compares non-zero at %d\n", __LINE__);
+  if (gcry_mpi_is_neg (a))
+    die ("unnormalized zero is reported negative at %d\n", __LINE__);
+  gcry_mpi_release (a);
+
+  /* A negative zero (0 - 1 + 1) must print and convert like zero.  */
+  a = gcry_mpi_set_ui (NULL, 0);
+  gcry_mpi_sub_ui (a, a, 1);
+  gcry_mpi_add_ui (a, a, 1);
+  val = 4711;
+  err = gcry_mpi_get_ui (&val, a);
+  if (err || val != 0)
+    die ("get_ui on negative zero failed at %d: %s\n",
+         __LINE__, gpg_strerror (err));
+  err = gcry_mpi_aprint (GCRYMPI_FMT_USG, &buf, &n, a);
+  if (err)
+    die ("printing a negative zero failed at %d: %s\n",
+         __LINE__, gpg_strerror (err));
+  if (n != 0)
+    die ("negative zero printed with length %zu at %d\n", n, __LINE__);
+  gcry_free (buf);
+  gcry_mpi_release (a);
+
+  /* The same value built through the scan interface with redundant
+   * leading zero bytes.  */
+  {
+    static const unsigned char zeros[8] = { 0,0,0,0,0,0,0,0 };
+    int i;
+
+    for (i = 0; i <= 8; i++)
+      {
+        b = NULL;
+        err = gcry_mpi_scan (&b, GCRYMPI_FMT_USG, zeros, i, NULL);
+        if (err)
+          die ("scanning %d zero bytes failed at %d: %s\n",
+               i, __LINE__, gpg_strerror (err));
+        val = 4711;
+        err = gcry_mpi_get_ui (&val, b);
+        if (err || val != 0)
+          die ("get_ui after scanning %d zero bytes failed at %d: %s\n",
+               i, __LINE__, gpg_strerror (err));
+        gcry_mpi_release (b);
+      }
+  }
+
+  /* An opaque value with zero length has no data but reports a bit
+   * length of zero.  */
+  a = gcry_mpi_set_opaque (NULL, NULL, 0);
+  if (!gcry_mpi_get_flag (a, GCRYMPI_FLAG_OPAQUE))
+    die ("zero length opaque value lost its opaque flag at %d\n", __LINE__);
+  if (gcry_mpi_get_nbits (a) != 0)
+    die ("zero length opaque value reports %u bits at %d\n",
+         gcry_mpi_get_nbits (a), __LINE__);
+  if (gcry_mpi_get_opaque (a, &val) != NULL || val != 0)
+    die ("zero length opaque value reports data at %d\n", __LINE__);
+
+  /* Copying such a value must yield an equivalent value.  */
+  b = gcry_mpi_copy (a);
+  if (!b || !gcry_mpi_get_flag (b, GCRYMPI_FLAG_OPAQUE)
+      || gcry_mpi_get_nbits (b) != 0)
+    die ("copying a zero length opaque value failed at %d\n", __LINE__);
+  gcry_mpi_release (b);
+
+  /* Printing it must behave like printing any empty value.  */
+  err = gcry_mpi_aprint (GCRYMPI_FMT_USG, &buf, &n, a);
+  if (err)
+    die ("printing a zero length opaque value failed at %d: %s\n",
+         __LINE__, gpg_strerror (err));
+  if (n != 0)
+    die ("zero length opaque value printed with length %zu at %d\n",
+         n, __LINE__);
+  gcry_free (buf);
+  err = gcry_mpi_aprint (GCRYMPI_FMT_PGP, &buf, &n, a);
+  if (err)
+    die ("printing a zero length opaque value as PGP failed at %d: %s\n",
+         __LINE__, gpg_strerror (err));
+  if (n != 2 || buf[0] || buf[1])
+    die ("zero length opaque PGP encoding wrong at %d\n", __LINE__);
+  gcry_free (buf);
+  gcry_mpi_release (a);
+
+  /* Setting a non-empty opaque value without data must be refused
+   * rather than dereferencing the NULL pointer.  */
+  a = gcry_mpi_set_opaque (NULL, NULL, 8);
+  if (a != NULL)
+    {
+      gcry_mpi_release (a);
+      die ("opaque value without data was not refused at %d\n", __LINE__);
+    }
+  if (gcry_mpi_set_opaque_copy (NULL, NULL, 8) != NULL)
+    die ("opaque copy without data was not refused at %d\n", __LINE__);
+
+  /* Requesting secure storage is a state transition which must work
+   * for a zero, whether or not it owns limb space, and must preserve
+   * whichever representation the value has.  */
+  a = gcry_mpi_set_ui (NULL, 0);
+  gcry_mpi_set_flag (a, GCRYMPI_FLAG_SECURE);
+  if (!gcry_mpi_get_flag (a, GCRYMPI_FLAG_SECURE))
+    die ("secure flag not set on zero at %d\n", __LINE__);
+  val = 4711;
+  err = gcry_mpi_get_ui (&val, a);
+  if (err || val != 0)
+    die ("secure zero changed value at %d: %s\n",
+         __LINE__, gpg_strerror (err));
+  gcry_mpi_release (a);
+
+  a = gcry_mpi_set_ui (NULL, 0);
+  gcry_mpi_set_bit (a, 200);
+  gcry_mpi_clear_bit (a, 200);   /* now a zero owning limb space */
+  gcry_mpi_set_flag (a, GCRYMPI_FLAG_SECURE);
+  if (!gcry_mpi_get_flag (a, GCRYMPI_FLAG_SECURE))
+    die ("secure flag not set on unnormalized zero at %d\n", __LINE__);
+  val = 4711;
+  err = gcry_mpi_get_ui (&val, a);
+  if (err || val != 0)
+    die ("secure unnormalized zero changed value at %d: %s\n",
+         __LINE__, gpg_strerror (err));
+  gcry_mpi_release (a);
+
+  a = gcry_mpi_set_opaque_copy (NULL, "\x01\x02\x03", 24);
+  gcry_mpi_set_flag (a, GCRYMPI_FLAG_SECURE);
+  if (!gcry_mpi_get_flag (a, GCRYMPI_FLAG_OPAQUE)
+      || !gcry_mpi_get_flag (a, GCRYMPI_FLAG_SECURE))
+    die ("flags after making an opaque value secure are wrong at %d\n",
+         __LINE__);
+  {
+    unsigned int nb = 0;
+    const unsigned char *p = gcry_mpi_get_opaque (a, &nb);
+
+    if (nb != 24 || !p || p[0] != 1 || p[1] != 2 || p[2] != 3)
+      die ("opaque payload changed when made secure at %d\n", __LINE__);
+  }
+  gcry_mpi_release (a);
+}
+
+
+/* Check the length boundaries of the serialization functions.  */
+static void
+test_serialize_boundaries (void)
+{
+  gpg_error_t err;
+  gcry_mpi_t a;
+  unsigned char *buf;
+  size_t n;
+  int i;
+
+  /* scan: a failure must not report a value nor a scan position.  */
+  {
+    static const unsigned char pgp_early[2] = { 0x40, 0x01 }; /* 16385 */
+
+    a = NULL;
+    n = 4711;
+    err = gcry_mpi_scan (&a, GCRYMPI_FMT_PGP, pgp_early, sizeof pgp_early, &n);
+    if (gpg_err_code (err) != GPG_ERR_INV_OBJ || a != NULL || n != 0)
+      die ("PGP bit limit error semantics wrong at %d\n", __LINE__);
+  }
+  {
+    /* Truncated payload: declared 16 bits but no data.  */
+    static const unsigned char pgp_trunc[2] = { 0x00, 0x10 };
+
+    a = NULL;
+    n = 4711;
+    err = gcry_mpi_scan (&a, GCRYMPI_FMT_PGP, pgp_trunc, sizeof pgp_trunc, &n);
+    if (gpg_err_code (err) != GPG_ERR_INV_OBJ || a != NULL || n != 0)
+      die ("truncated PGP error semantics wrong at %d\n", __LINE__);
+  }
+  {
+    /* SSH with a declared length larger than the buffer.  */
+    static const unsigned char ssh_big[5] = { 0, 0, 0, 4, 0x01 };
+
+    a = NULL;
+    n = 4711;
+    err = gcry_mpi_scan (&a, GCRYMPI_FMT_SSH, ssh_big, sizeof ssh_big, &n);
+    if (gpg_err_code (err) != GPG_ERR_TOO_LARGE || a != NULL || n != 0)
+      die ("oversized SSH error semantics wrong at %d\n", __LINE__);
+  }
+  {
+    /* SSH header incomplete.  */
+    static const unsigned char ssh_short[3] = { 0, 0, 0 };
+
+    a = NULL;
+    n = 4711;
+    err = gcry_mpi_scan (&a, GCRYMPI_FMT_SSH, ssh_short, sizeof ssh_short, &n);
+    if (gpg_err_code (err) != GPG_ERR_TOO_SHORT || a != NULL || n != 0)
+      die ("short SSH error semantics wrong at %d\n", __LINE__);
+  }
+
+  /* A missing buffer must be reported as an invalid argument and not
+   * crash.  */
+  a = NULL;
+  n = 4711;
+  err = gcry_mpi_scan (&a, GCRYMPI_FMT_USG, NULL, 4, &n);
+  if (gpg_err_code (err) != GPG_ERR_INV_ARG || a != NULL || n != 0)
+    die ("NULL buffer error semantics wrong at %d\n", __LINE__);
+  a = NULL;
+  err = gcry_mpi_scan (&a, GCRYMPI_FMT_HEX, NULL, 0, NULL);
+  if (gpg_err_code (err) != GPG_ERR_INV_ARG || a != NULL)
+    die ("NULL HEX buffer error semantics wrong at %d\n", __LINE__);
+
+  /* A successful empty scan reports an empty value and a zero scan
+   * position for every format.  */
+  {
+    static const struct {
+      enum gcry_mpi_format format;
+      const unsigned char *data;
+      size_t len;
+      size_t expect_scanned;
+    } empty[] = {
+      { GCRYMPI_FMT_USG, (const unsigned char *)"", 0, 0 },
+      { GCRYMPI_FMT_STD, (const unsigned char *)"", 0, 0 },
+      { GCRYMPI_FMT_PGP, (const unsigned char *)"\0\0", 2, 2 },
+      { GCRYMPI_FMT_SSH, (const unsigned char *)"\0\0\0\0", 4, 4 },
+      { GCRYMPI_FMT_HEX, (const unsigned char *)"", 0, 0 },
+    };
+
+    for (i = 0; i < (int)(sizeof empty / sizeof *empty); i++)
+      {
+        a = NULL;
+        n = 4711;
+        err = gcry_mpi_scan (&a, empty[i].format, empty[i].data,
+                             empty[i].len, &n);
+        if (err)
+          die ("empty scan of format %d failed at %d: %s\n",
+               i, __LINE__, gpg_strerror (err));
+        if (!a || gcry_mpi_get_nbits (a) != 0)
+          die ("empty scan of format %d did not yield zero at %d\n",
+               i, __LINE__);
+        if (n != empty[i].expect_scanned)
+          die ("empty scan of format %d scanned %zu bytes at %d\n",
+               i, n, __LINE__);
+        gcry_mpi_release (a);
+      }
+  }
+
+  /* print: the PGP length header cannot represent values beyond the
+   * documented limit.  Such a value must be refused, not truncated.  */
+  a = gcry_mpi_set_ui (NULL, 0);
+  gcry_mpi_set_bit (a, 16384);   /* 16385 bits.  */
+  err = gcry_mpi_aprint (GCRYMPI_FMT_PGP, &buf, &n, a);
+  if (gpg_err_code (err) != GPG_ERR_TOO_LARGE)
+    die ("PGP print accepted an oversized value at %d: %s\n",
+         __LINE__, gpg_strerror (err));
+  gcry_mpi_release (a);
+
+  /* The largest representable value must still work and round-trip.  */
+  a = gcry_mpi_set_ui (NULL, 0);
+  gcry_mpi_set_bit (a, 16383);   /* 16384 bits.  */
+  err = gcry_mpi_aprint (GCRYMPI_FMT_PGP, &buf, &n, a);
+  if (err)
+    die ("PGP print of the largest value failed at %d: %s\n",
+         __LINE__, gpg_strerror (err));
+  if (n != 2 + 2048 || (buf[0] << 8 | buf[1]) != 16384)
+    die ("PGP print of the largest value has a wrong header at %d\n",
+         __LINE__);
+  {
+    gcry_mpi_t b = NULL;
+    size_t scanned = 0;
+
+    err = gcry_mpi_scan (&b, GCRYMPI_FMT_PGP, buf, n, &scanned);
+    if (err)
+      die ("round-trip scan of the largest PGP value failed at %d: %s\n",
+           __LINE__, gpg_strerror (err));
+    if (scanned != n || gcry_mpi_cmp (a, b))
+      die ("round-trip of the largest PGP value differs at %d\n", __LINE__);
+    gcry_mpi_release (b);
+  }
+  gcry_free (buf);
+
+  /* A buffer which is too short must be reported, not overflowed.  */
+  {
+    unsigned char small[3];
+
+    n = 0;
+    err = gcry_mpi_print (GCRYMPI_FMT_PGP, small, sizeof small, &n, a);
+    if (gpg_err_code (err) != GPG_ERR_TOO_SHORT || n != 0)
+      die ("short PGP output buffer error semantics wrong at %d\n", __LINE__);
+  }
+  gcry_mpi_release (a);
+
+  /* Query mode of print does not depend on a buffer being supplied.  */
+  a = gcry_mpi_set_ui (NULL, 0x80);
+  n = 4711;
+  err = gcry_mpi_print (GCRYMPI_FMT_STD, NULL, 0, &n, a);
+  if (err || n != 2)
+    die ("print query for a value with a leading zero bit failed at %d\n",
+         __LINE__);
+  gcry_mpi_release (a);
+}
+
+
 static void
 test_cmp (void)
 {
@@ -850,6 +1172,8 @@ main (int argc, char* argv[])
   test_const_and_immutable ();
   test_opaque ();
   test_maxsize ();
+  test_zero_normalization ();
+  test_serialize_boundaries ();
   test_cmp ();
   test_add ();
   test_sub ();

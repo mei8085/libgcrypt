@@ -43,7 +43,9 @@
 #define MAX_EXTERN_MPI_BITS 16384
 
 
-/* Helper used to scan PGP style MPIs.  Returns NULL on failure. */
+/* Helper used to scan PGP style MPIs.  Returns NULL on failure.  On
+ * failure *RET_NREAD is set to a value which must not be interpreted as
+ * a successful scan; the caller reports no scan position in that case. */
 static gcry_mpi_t
 mpi_read_from_buffer (const unsigned char *buffer, unsigned *ret_nread,
                       int secure)
@@ -66,6 +68,15 @@ mpi_read_from_buffer (const unsigned char *buffer, unsigned *ret_nread,
   nread = 2;
 
   nbytes = (nbits+7) / 8;
+  /* Reject a value whose payload does not fit into the buffer before
+     allocating anything.  This keeps a truncated input from being
+     reported as a different error depending on where the truncation
+     happens and avoids a large pointless allocation.  */
+  if (nbytes > max_nread - nread)
+    {
+      nread = max_nread;
+      goto leave;
+    }
   nlimbs = (nbytes+BYTES_PER_MPI_LIMB-1) / BYTES_PER_MPI_LIMB;
   val = secure? mpi_alloc_secure (nlimbs) : mpi_alloc (nlimbs);
   i = BYTES_PER_MPI_LIMB - nbytes % BYTES_PER_MPI_LIMB;
@@ -384,12 +395,25 @@ _gcry_mpi_get_buffer (gcry_mpi_t a, unsigned int fill_le,
   if (mpi_get_flag (a, GCRYMPI_FLAG_OPAQUE))
     {
       unsigned int nbits;
-      byte *p = _gcry_mpi_get_opaque_copy (a, &nbits);
+      unsigned int nbytes;
+      byte *p;
 
+      if (sign)
+        *sign = 0;
+      p = _gcry_mpi_get_opaque_copy (a, &nbits);
+      nbytes = (nbits + 7) / 8;
       if (r_nbytes)
-        *r_nbytes = (nbits+7)/8;
+        *r_nbytes = nbytes;
 
-      return p;
+      if (p)
+        return p;
+
+      /* An opaque value with zero length has no payload but must still
+         behave like any other empty value: provide an allocated (at
+         least one byte) buffer so that callers can free it.  */
+      if (!nbytes)
+        return xtrymalloc (1);
+      return NULL;
     }
   else
     return do_get_buffer (a, fill_le, 0, r_nbytes, sign, 0);
@@ -544,12 +568,22 @@ _gcry_mpi_scan (struct gcry_mpi **ret_mpi, enum gcry_mpi_format format,
   unsigned int len;
   int secure = (buffer && _gcry_is_secure (buffer));
 
+  /* On failure neither a value nor a scan position is reported.  Set
+     this up front so that every early return follows the same rule. */
+  if (ret_mpi)
+    *ret_mpi = NULL;
+  if (nscanned)
+    *nscanned = 0;
+
+  /* Check the generic input limits first; they do not depend on the
+     format and must be applied before looking at the data.  */
   if (buflen > MAX_EXTERN_SCAN_BYTES)
-    {
-      if (nscanned)
-        *nscanned = 0;
-      return GPG_ERR_INV_OBJ;
-    }
+    return GPG_ERR_INV_OBJ;
+
+  /* Except for an empty octet string a buffer must be supplied.  The
+     HEX format always requires a NUL terminated string.  */
+  if (!buffer && (buflen || format == GCRYMPI_FMT_HEX))
+    return GPG_ERR_INV_ARG;
 
   len = buflen;
 
@@ -604,19 +638,23 @@ _gcry_mpi_scan (struct gcry_mpi **ret_mpi, enum gcry_mpi_format format,
   else if (format == GCRYMPI_FMT_PGP)
     {
       a = mpi_read_from_buffer (buffer, &len, secure);
-      if (nscanned)
-        *nscanned = len;
-      if (ret_mpi && a)
+      if (a && ret_mpi)
         {
           mpi_normalize (a);
           *ret_mpi = a;
-	}
+          if (nscanned)
+            *nscanned = len;
+          return 0;
+        }
       else if (a)
         {
-          mpi_free(a);
-          a = NULL;
-        }
-      return a? 0 : GPG_ERR_INV_OBJ;
+          mpi_free (a);
+          if (nscanned)
+            *nscanned = len;
+          return 0;
+	}
+      /* Failure: neither a value nor a scan position is reported.  */
+      return GPG_ERR_INV_OBJ;
     }
   else if (format == GCRYMPI_FMT_SSH)
     {
@@ -802,6 +840,12 @@ _gcry_mpi_print (enum gcry_mpi_format format,
       /* The PGP format can only handle unsigned integers.  */
       if (negative)
         return GPG_ERR_INV_ARG;
+
+      /* The length header cannot represent values beyond the documented
+         PGP limit; refuse instead of writing a wrapped or truncated
+         header.  */
+      if (nbits > MAX_EXTERN_MPI_BITS)
+        return GPG_ERR_TOO_LARGE;
 
       if (buffer && n+2 > len)
         return GPG_ERR_TOO_SHORT;
