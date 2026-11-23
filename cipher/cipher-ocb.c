@@ -749,14 +749,17 @@ _gcry_cipher_ocb_check_tag (gcry_cipher_hd_t c, const unsigned char *intag,
   if (!c->u_mode.ocb.data_finalized)
     return GPG_ERR_INV_STATE; /* Data has not yet been finalized.  */
 
+  /* The tag length is fixed when the nonce is set.  A tag of a
+     different length cannot be verified; report the length problem
+     separately from an authentication failure.  */
+  if (taglen != c->u_mode.ocb.taglen)
+    return GPG_ERR_INV_LENGTH;
+
   compute_tag_if_needed (c);
 
   n = c->u_mode.ocb.taglen;
-  if (taglen < n)
-    n = taglen;
 
-  if (!buf_eq_const (intag, c->u_mode.ocb.tag, n)
-      || c->u_mode.ocb.taglen != taglen)
+  if (!buf_eq_const (intag, c->u_mode.ocb.tag, n))
     return GPG_ERR_CHECKSUM;
 
   return 0;

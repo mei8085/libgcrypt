@@ -1294,6 +1294,8 @@ gcry_err_code_t
 _gcry_cipher_decrypt (gcry_cipher_hd_t h, void *out, size_t outsize,
                       const void *in, size_t inlen)
 {
+  gcry_err_code_t rc;
+
   if (!in) /* Caller requested in-place encryption. */
     {
       in = out;
@@ -1306,7 +1308,23 @@ _gcry_cipher_decrypt (gcry_cipher_hd_t h, void *out, size_t outsize,
       return GPG_ERR_MISSING_KEY;
     }
 
-  return h->mode_ops.decrypt (h, out, outsize, in, inlen);
+  rc = h->mode_ops.decrypt (h, out, outsize, in, inlen);
+
+  /* Failsafe: A failed decryption must never leave (parts of) the
+     plaintext in the caller's buffer.  This covers early argument and
+     state errors (e.g. GPG_ERR_BUFFER_TOO_SHORT, GPG_ERR_INV_LENGTH or
+     GPG_ERR_INV_STATE) as well as a failure that occurred after some
+     output has already been produced.  The output region an
+     implementation can have written to is bounded by INLEN (it never
+     writes more than the ciphertext length it was given), so exactly
+     that much is cleared; this mirrors the 0x42 pattern of the
+     encryption failsafe while leaving unrelated bytes in an oversized
+     output buffer alone.  Wipememory is used so that the store cannot
+     be optimized away.  */
+  if (rc && out && inlen)
+    wipememory2 (out, 0x42, inlen < outsize ? inlen : outsize);
+
+  return rc;
 }
 
 
@@ -1443,6 +1461,11 @@ _gcry_cipher_authenticate (gcry_cipher_hd_t hd, const void *abuf,
 {
   gcry_err_code_t rc;
 
+  /* A zero length AAD chunk is a no-op and is allowed with or without
+     a buffer.  Non-empty AAD without a buffer is an argument error.  */
+  if (!abuf && abuflen)
+    return GPG_ERR_INV_ARG;
+
   if (hd->mode_ops.authenticate)
     {
       rc = hd->mode_ops.authenticate (hd, abuf, abuflen);
@@ -1462,6 +1485,15 @@ _gcry_cipher_gettag (gcry_cipher_hd_t hd, void *outtag, size_t taglen)
 {
   gcry_err_code_t rc;
 
+  /* Never let a mode implementation dereference a NULL tag buffer.
+     A zero length tag is a length error (it cannot carry any
+     authentication information); report it consistently for all
+     modes, before any state is touched.  */
+  if (!outtag)
+    return GPG_ERR_INV_ARG;
+  if (!taglen)
+    return GPG_ERR_INV_LENGTH;
+
   if (hd->mode_ops.get_tag)
     {
       rc = hd->mode_ops.get_tag (hd, outtag, taglen);
@@ -1480,6 +1512,15 @@ gcry_err_code_t
 _gcry_cipher_checktag (gcry_cipher_hd_t hd, const void *intag, size_t taglen)
 {
   gcry_err_code_t rc;
+
+  /* Never let a mode implementation dereference a NULL tag buffer.
+     A zero length tag is a length error; checking it would always
+     succeed and silently disable authentication.  Report it
+     consistently for all modes, before any state is touched.  */
+  if (!intag)
+    return GPG_ERR_INV_ARG;
+  if (!taglen)
+    return GPG_ERR_INV_LENGTH;
 
   if (hd->mode_ops.check_tag)
     {

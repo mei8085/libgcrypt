@@ -1348,16 +1348,37 @@ static struct bench_ops ccm_authenticate_ops = {
 };
 
 
+/* Return the tag length this mode uses, or 0 on error.  Modes such as
+   EAX with a 64-bit block cipher use a shorter tag than 16 bytes.  */
+static size_t
+bench_aead_get_taglen (gcry_cipher_hd_t hd)
+{
+  size_t taglen = 0;
+
+  if (gcry_cipher_info (hd, GCRYCTL_GET_TAGLEN, NULL, &taglen))
+    return 0;
+  return taglen;
+}
+
 static void
 bench_aead_encrypt_do_bench (struct bench_obj *obj, void *buf, size_t buflen,
 			     const char *nonce, size_t noncelen)
 {
   gcry_cipher_hd_t hd = obj->hd;
   int err;
+  size_t taglen;
   char tag[16];
 
   gcry_cipher_reset (hd);
   gcry_cipher_setiv (hd, nonce, noncelen);
+
+  taglen = bench_aead_get_taglen (hd);
+  if (!taglen || taglen > sizeof (tag))
+    {
+      fprintf (stderr, PGM ": gcry_cipher_info failed\n");
+      gcry_cipher_close (hd);
+      exit (1);
+    }
 
   gcry_cipher_final (hd);
   err = gcry_cipher_encrypt (hd, buf, buflen, buf, buflen);
@@ -1369,7 +1390,7 @@ bench_aead_encrypt_do_bench (struct bench_obj *obj, void *buf, size_t buflen,
       exit (1);
     }
 
-  err = gcry_cipher_gettag (hd, tag, sizeof (tag));
+  err = gcry_cipher_gettag (hd, tag, taglen);
   if (err)
     {
       fprintf (stderr, PGM ": gcry_cipher_gettag failed: %s\n",
@@ -1385,12 +1406,21 @@ bench_aead_decrypt_do_bench (struct bench_obj *obj, void *buf, size_t buflen,
 {
   gcry_cipher_hd_t hd = obj->hd;
   int err;
+  size_t taglen;
   char tag[16] = { 0, };
 
   gcry_cipher_reset (hd);
-  gcry_cipher_set_decryption_tag (hd, tag, 16);
-
   gcry_cipher_setiv (hd, nonce, noncelen);
+
+  taglen = bench_aead_get_taglen (hd);
+  if (!taglen || taglen > sizeof (tag))
+    {
+      fprintf (stderr, PGM ": gcry_cipher_info failed\n");
+      gcry_cipher_close (hd);
+      exit (1);
+    }
+
+  gcry_cipher_set_decryption_tag (hd, tag, taglen);
 
   gcry_cipher_final (hd);
   err = gcry_cipher_decrypt (hd, buf, buflen, buf, buflen);
@@ -1404,12 +1434,12 @@ bench_aead_decrypt_do_bench (struct bench_obj *obj, void *buf, size_t buflen,
       exit (1);
     }
 
-  err = gcry_cipher_checktag (hd, tag, sizeof (tag));
+  err = gcry_cipher_checktag (hd, tag, taglen);
   if (gpg_err_code (err) == GPG_ERR_CHECKSUM)
     err = gpg_error (GPG_ERR_NO_ERROR);
   if (err)
     {
-      fprintf (stderr, PGM ": gcry_cipher_gettag failed: %s\n",
+      fprintf (stderr, PGM ": gcry_cipher_checktag failed: %s\n",
            gpg_strerror (err));
       gcry_cipher_close (hd);
       exit (1);

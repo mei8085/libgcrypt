@@ -249,10 +249,20 @@ _gcry_cipher_poly1305_tag (gcry_cipher_hd_t c,
 {
   gcry_err_code_t err;
 
-  if (outbuflen < POLY1305_TAGLEN)
-    return GPG_ERR_BUFFER_TOO_SHORT;
   if (c->u_mode.poly1305.bytecount_over_limits)
     return GPG_ERR_INV_LENGTH;
+
+  /* POLY1305 uses a fixed 128 bit tag.  A truncated or oversized tag
+     cannot be verified; report the length problem separately from an
+     authentication failure so that the caller can tell the two apart.
+     This is done before any state is finalized so that the context is
+     left untouched and a retry with the correct length still works.  */
+  if (check && outbuflen != POLY1305_TAGLEN)
+    return GPG_ERR_INV_LENGTH;
+
+  /* For get_tag a smaller buffer is an ordinary buffer problem.  */
+  if (outbuflen < POLY1305_TAGLEN)
+    return GPG_ERR_BUFFER_TOO_SHORT;
 
   if (!c->marks.iv)
     {
@@ -283,10 +293,8 @@ _gcry_cipher_poly1305_tag (gcry_cipher_hd_t c,
     }
   else
     {
-      /* OUTBUFLEN gives the length of the user supplied tag in OUTBUF
-       * and thus we need to compare its length first.  */
-      if (outbuflen != POLY1305_TAGLEN
-          || !buf_eq_const (outbuf, c->u_iv.iv, POLY1305_TAGLEN))
+      /* Tag length has been validated above.  */
+      if (!buf_eq_const (outbuf, c->u_iv.iv, POLY1305_TAGLEN))
         return GPG_ERR_CHECKSUM;
     }
 

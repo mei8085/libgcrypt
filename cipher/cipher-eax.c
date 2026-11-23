@@ -235,6 +235,16 @@ _gcry_cipher_eax_tag (gcry_cipher_hd_t c,
 {
   gcry_err_code_t err;
 
+  /* EAX allows a truncated tag of any length up to the block size,
+     but never a zero length tag.  When a tag is validated the length
+     must be in range; when it is written out a larger buffer is
+     accepted and only a full tag is stored (compatibility with the
+     other AEAD modes).  */
+  if (!outbuflen)
+    return GPG_ERR_INV_LENGTH;
+  if (check && outbuflen > c->spec->blocksize)
+    return GPG_ERR_INV_LENGTH;
+
   if (!c->marks.tag)
     {
       err = _gcry_cmac_final (c, &c->u_mode.eax.cmac_header);
@@ -269,8 +279,7 @@ _gcry_cipher_eax_tag (gcry_cipher_hd_t c,
     {
       /* OUTBUFLEN gives the length of the user supplied tag in OUTBUF
        * and thus we need to compare its length first.  */
-      if (!(outbuflen <= c->spec->blocksize)
-          || !buf_eq_const (outbuf, c->u_iv.iv, outbuflen))
+      if (!buf_eq_const (outbuf, c->u_iv.iv, outbuflen))
         return GPG_ERR_CHECKSUM;
     }
 

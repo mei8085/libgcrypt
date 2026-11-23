@@ -268,7 +268,9 @@ _gcry_cipher_ccm_tag (gcry_cipher_hd_t c, unsigned char *outbuf,
 
   if (!outbuf || outbuflen == 0)
     return GPG_ERR_INV_ARG;
-  /* Tag length must be same as initial authlen.  */
+  /* Tag length must be same as initial authlen.  This is checked
+     before any state is finalized so that the context is untouched by
+     an invalid request.  */
   if (c->u_mode.ccm.authlen != outbuflen)
     return GPG_ERR_INV_LENGTH;
   if (!c->u_mode.ccm.nonce || !c->u_mode.ccm.lengths || c->u_mode.ccm.aadlen > 0)

@@ -10027,6 +10027,232 @@ check_ocb_cipher (void)
 }
 
 
+/* Check the AEAD boundaries that are independent of the test vectors:
+   truncated/invalid tag lengths must be reported as a distinct
+   GPG_ERR_INV_LENGTH (not as an authentication failure), a NULL tag
+   buffer must not crash, a zero length tag must never authenticate,
+   and a failed decryption must not leave plaintext in the caller's
+   output buffer.  These checks are done for the detached-tag modes
+   (CCM, EAX, GCM, OCB, POLY1305), where the caller verifies the tag
+   with a separate gcry_cipher_checktag call.  */
+static void
+check_aead_tag_boundaries (void)
+{
+  static const unsigned char key[32] =
+    "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+    "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f";
+  static const unsigned char nonce[16] =
+    "\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf";
+  static const unsigned char plain[32] =
+    "\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff"
+    "\x0f\x1e\x2d\x3c\x4b\x5a\x69\x78\x87\x96\xa5\xb4\xc3\xd2\xe1\xf0";
+  static const struct
+  {
+    int algo;
+    int mode;
+    int keylen;
+    int noncelen;
+    int taglen;
+    int trunc_ok;   /* 1 if truncated tags (prefix match) are accepted.  */
+    const char *name;
+  } tv[] =
+    {
+      { GCRY_CIPHER_AES, GCRY_CIPHER_MODE_GCM, 16, 12, 16, 1, "gcm" },
+      { GCRY_CIPHER_AES, GCRY_CIPHER_MODE_EAX, 16, 16, 16, 1, "eax" },
+      { GCRY_CIPHER_AES, GCRY_CIPHER_MODE_OCB, 16, 12, 16, 0, "ocb" },
+      { GCRY_CIPHER_CHACHA20, GCRY_CIPHER_MODE_POLY1305, 32, 12, 16, 0,
+        "poly1305" },
+      { GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CCM, 16, 13, 16, 0, "ccm" }
+    };
+  enum { MAXLEN = sizeof (plain) };
+  unsigned char ct[MAXLEN];
+  unsigned char out[MAXLEN];
+  unsigned char tag[32];
+  unsigned char badtag[32];
+  gcry_cipher_hd_t hde, hdd;
+  gcry_error_t err;
+  unsigned int i;
+  int b;
+
+  if (verbose)
+    fprintf (stderr, "  Starting AEAD tag boundary checks.\n");
+
+  for (i = 0; i < DIM (tv); i++)
+    {
+      if (gcry_cipher_test_algo (tv[i].algo))
+        continue;
+      if (in_fips_mode && tv[i].algo == GCRY_CIPHER_CHACHA20)
+        continue;
+      /* GCM encryption with a directly supplied IV is disabled in
+         FIPS mode (checked by check_gcm_cipher as well).  */
+      if (in_fips_mode && tv[i].mode == GCRY_CIPHER_MODE_GCM)
+        continue;
+
+      /* --- Encrypt a block and obtain the tag.  --- */
+      err = gcry_cipher_open (&hde, tv[i].algo, tv[i].mode, 0);
+      if (err)
+        {
+          fail ("aead-bounds %s: gcry_cipher_open failed: %s\n",
+                tv[i].name, gpg_strerror (err));
+          continue;
+        }
+      err = gcry_cipher_setkey (hde, key, tv[i].keylen);
+      if (!err)
+        err = gcry_cipher_setiv (hde, nonce, tv[i].noncelen);
+      if (!err && tv[i].mode == GCRY_CIPHER_MODE_CCM)
+        {
+          u64 params[3];
+
+          params[0] = sizeof (plain);   /* encryptedlen  */
+          params[1] = 0;                /* aadlen        */
+          params[2] = tv[i].taglen;     /* authtaglen    */
+          err = gcry_cipher_ctl (hde, GCRYCTL_SET_CCM_LENGTHS, params,
+                                 sizeof (params));
+        }
+      if (!err && tv[i].mode == GCRY_CIPHER_MODE_OCB)
+        err = gcry_cipher_final (hde);
+      if (!err)
+        err = gcry_cipher_encrypt (hde, ct, sizeof (ct), plain, sizeof (plain));
+      if (!err)
+        err = gcry_cipher_gettag (hde, tag, tv[i].taglen);
+      gcry_cipher_close (hde);
+      if (err)
+        {
+          fail ("aead-bounds %s: encryption failed: %s\n",
+                tv[i].name, gpg_strerror (err));
+          continue;
+        }
+
+      /* --- The tag length must be validated consistently.  --- */
+      for (b = 0; b < 2; b++)
+        {
+          int badlen = b ? tv[i].taglen + 1 : tv[i].taglen - 1;
+
+          err = gcry_cipher_open (&hdd, tv[i].algo, tv[i].mode, 0);
+          if (!err)
+            err = gcry_cipher_setkey (hdd, key, tv[i].keylen);
+          if (!err)
+            err = gcry_cipher_setiv (hdd, nonce, tv[i].noncelen);
+          if (!err && tv[i].mode == GCRY_CIPHER_MODE_CCM)
+            {
+              u64 params[3];
+
+              params[0] = sizeof (plain);
+              params[1] = 0;
+              params[2] = tv[i].taglen;
+              err = gcry_cipher_ctl (hdd, GCRYCTL_SET_CCM_LENGTHS, params,
+                                     sizeof (params));
+            }
+          if (!err && tv[i].mode == GCRY_CIPHER_MODE_OCB)
+            err = gcry_cipher_final (hdd);
+          if (!err)
+            err = gcry_cipher_decrypt (hdd, out, sizeof (out), ct,
+                                       sizeof (ct));
+          if (err)
+            {
+              fail ("aead-bounds %s: decryption failed: %s\n",
+                    tv[i].name, gpg_strerror (err));
+              gcry_cipher_close (hdd);
+              continue;
+            }
+
+          /* A NULL tag buffer must never crash.  */
+          err = gcry_cipher_checktag (hdd, NULL, tv[i].taglen);
+          if (gcry_err_code (err) != GPG_ERR_INV_ARG)
+            fail ("aead-bounds %s: NULL tag not rejected: %s\n",
+                  tv[i].name, gpg_strerror (err));
+
+          /* A zero length tag must never be accepted.  */
+          err = gcry_cipher_checktag (hdd, tag, 0);
+          if (gcry_err_code (err) != GPG_ERR_INV_LENGTH)
+            fail ("aead-bounds %s: zero tag length not rejected: %s\n",
+                  tv[i].name, gpg_strerror (err));
+
+          /* Truncated/extended tags: when the mode permits tag
+             truncation and the length is in range, a matching prefix
+             is accepted; otherwise the length is rejected as a length
+             problem (not as an authentication failure).  */
+          err = gcry_cipher_checktag (hdd, tag, badlen);
+          if (badlen < tv[i].taglen && tv[i].trunc_ok)
+            {
+              if (err)
+                fail ("aead-bounds %s: truncated tag %d rejected: %s\n",
+                      tv[i].name, badlen, gpg_strerror (err));
+            }
+          else
+            {
+              if (gcry_err_code (err) != GPG_ERR_INV_LENGTH)
+                fail ("aead-bounds %s: invalid tag length %d not rejected "
+                      "with INV_LENGTH: %s\n",
+                      tv[i].name, badlen, gpg_strerror (err));
+            }
+
+          /* The context must still be usable: the correct tag is
+             accepted after the rejected requests.  */
+          err = gcry_cipher_checktag (hdd, tag, tv[i].taglen);
+          if (err)
+            fail ("aead-bounds %s: correct tag rejected after invalid "
+                  "requests: %s\n", tv[i].name, gpg_strerror (err));
+
+          /* An incorrect tag must fail with GPG_ERR_CHECKSUM.  */
+          memcpy (badtag, tag, tv[i].taglen);
+          badtag[0] ^= 0x01;
+          err = gcry_cipher_checktag (hdd, badtag, tv[i].taglen);
+          if (gpg_err_code (err) != GPG_ERR_CHECKSUM)
+            fail ("aead-bounds %s: wrong tag not rejected with CHECKSUM: "
+                  "%s\n", tv[i].name, gpg_strerror (err));
+
+          gcry_cipher_close (hdd);
+        }
+
+      /* --- A rejected decryption must not leak plaintext.  --- */
+      err = gcry_cipher_open (&hdd, tv[i].algo, tv[i].mode, 0);
+      if (!err)
+        err = gcry_cipher_setkey (hdd, key, tv[i].keylen);
+      if (!err)
+        err = gcry_cipher_setiv (hdd, nonce, tv[i].noncelen);
+      if (!err && tv[i].mode == GCRY_CIPHER_MODE_CCM)
+        {
+          u64 params[3];
+
+          params[0] = sizeof (plain);
+          params[1] = 0;
+          params[2] = tv[i].taglen;
+          err = gcry_cipher_ctl (hdd, GCRYCTL_SET_CCM_LENGTHS, params,
+                                 sizeof (params));
+        }
+      if (err)
+        {
+          fail ("aead-bounds %s: setup for failsafe failed: %s\n",
+                tv[i].name, gpg_strerror (err));
+          gcry_cipher_close (hdd);
+          continue;
+        }
+
+      /* Ask for decryption into a buffer that is too small; this is
+         rejected before any output could be produced, and the output
+         buffer must be poisoned rather than holding plaintext.  */
+      memset (out, 0, sizeof (out));
+      err = gcry_cipher_decrypt (hdd, out, sizeof (out) - 1, ct,
+                                 sizeof (ct));
+      if (gpg_err_code (err) != GPG_ERR_BUFFER_TOO_SHORT)
+        fail ("aead-bounds %s: short output not rejected: %s\n",
+              tv[i].name, gpg_strerror (err));
+      for (b = 0; b < (int)(sizeof (out) - 1); b++)
+        if (out[b] == plain[b])
+          {
+            fail ("aead-bounds %s: plaintext left in output buffer after "
+                  "failed decryption (offset %d)\n", tv[i].name, b);
+            break;
+          }
+      gcry_cipher_close (hdd);
+    }
+
+  if (verbose)
+    fprintf (stderr, "  Completed AEAD tag boundary checks.\n");
+}
+
+
 
 static void
 do_check_xts_cipher (int inplace)
@@ -14237,6 +14463,7 @@ check_cipher_modes(void)
     }
   check_poly1305_cipher ();
   check_ocb_cipher ();
+  check_aead_tag_boundaries ();
   check_xts_cipher ();
   check_eax_cipher ();
   check_siv_cipher ();

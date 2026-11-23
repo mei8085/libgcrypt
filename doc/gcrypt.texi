@@ -2116,7 +2116,23 @@ the authentication tag calculated during decryption.
 
 Depending on the used mode certain restrictions for @var{taglen} are
 enforced: For GCM @var{taglen} must either be 16 or one of the allowed
-truncated lengths (4, 8, 12, 13, 14, or 15).
+truncated lengths (4, 8, 12, 13, 14, or 15).  For EAX any length from 1
+to the block length is accepted.  OCB, CCM, Poly1305, SIV and GCM-SIV
+use a fixed tag length (as reported by @code{GCRYCTL_GET_TAGLEN}) and
+require exactly that length.  A @var{taglen} that is not valid for the
+mode is rejected with @code{GPG_ERR_INV_LENGTH} and is reported
+separately from an authentication failure; a zero @var{taglen}, which
+would always compare equal, and a @code{NULL} @var{tag} are likewise
+rejected with @code{GPG_ERR_INV_LENGTH} and @code{GPG_ERR_INV_ARG},
+respectively.
+
+Note that for the detached-tag modes the plaintext produced by the
+preceding decryption is only authenticated once this function has
+succeeded.  A successful @code{gcry_cipher_decrypt} therefore does not
+by itself guarantee that the data is authentic: if this function then
+returns @code{GPG_ERR_CHECKSUM} the caller must not use the plaintext
+and should discard it.  A decryption call that fails itself never
+leaves plaintext in its output buffer.
 
 @end deftypefun
 
@@ -2192,6 +2208,11 @@ the buffers must be a multiple of the block size.
 
 Some encryption modes require that @code{gcry_cipher_final} is used
 before the final data chunk is passed to this function.
+
+If the function returns an error, the output buffer is filled with a
+non-plaintext pattern instead of leaving any decrypted data in it.  This
+failsafe is meant for callers which do not check the return value: no
+plaintext is exposed when decryption fails.
 
 The function returns @code{0} on success or an error code.
 @end deftypefun

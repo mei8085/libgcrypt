@@ -496,6 +496,8 @@ gcry_err_code_t
 _gcry_cipher_gcm_siv_set_decryption_tag (gcry_cipher_hd_t c,
 					 const byte *tag, size_t taglen)
 {
+  if (!tag)
+    return GPG_ERR_INV_ARG;
   if (taglen != GCRY_SIV_BLOCK_LEN)
     return GPG_ERR_INV_ARG;
   if (c->spec->blocksize != GCRY_SIV_BLOCK_LEN)
@@ -595,6 +597,16 @@ _gcry_cipher_gcm_siv_tag (gcry_cipher_hd_t c,
 {
   gcry_err_code_t err;
 
+  if (!outbuflen)
+    return GPG_ERR_INV_LENGTH;
+
+  /* GCM-SIV uses a fixed 128 bit tag.  A truncated or oversized tag
+     cannot be verified; report the length problem separately from an
+     authentication failure.  This is checked before any state is
+     modified so that the context stays retryable.  */
+  if (check && outbuflen != GCRY_SIV_BLOCK_LEN)
+    return GPG_ERR_INV_LENGTH;
+
   if (!c->marks.tag)
     {
       if (!c->u_mode.gcm.ghash_fn)
@@ -627,10 +639,8 @@ _gcry_cipher_gcm_siv_tag (gcry_cipher_hd_t c,
     }
   else
     {
-      /* OUTBUFLEN gives the length of the user supplied tag in OUTBUF
-       * and thus we need to compare its length first.  */
-      if (outbuflen != GCRY_SIV_BLOCK_LEN
-          || !buf_eq_const (outbuf, c->u_mode.gcm.tagiv, outbuflen))
+      /* Tag length has been validated above.  */
+      if (!buf_eq_const (outbuf, c->u_mode.gcm.tagiv, GCRY_SIV_BLOCK_LEN))
         return GPG_ERR_CHECKSUM;
     }
 

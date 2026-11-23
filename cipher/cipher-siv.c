@@ -247,6 +247,8 @@ gcry_err_code_t
 _gcry_cipher_siv_set_decryption_tag (gcry_cipher_hd_t c,
 				     const byte *tag, size_t taglen)
 {
+  if (!tag)
+    return GPG_ERR_INV_ARG;
   if (taglen != GCRY_SIV_BLOCK_LEN)
     return GPG_ERR_INV_ARG;
   if (c->spec->blocksize != GCRY_SIV_BLOCK_LEN)
@@ -346,10 +348,15 @@ _gcry_cipher_siv_check_tag (gcry_cipher_hd_t c, const unsigned char *intag,
                             size_t taglen)
 {
   gcry_err_code_t err;
-  size_t n;
 
   if (c->spec->blocksize != GCRY_SIV_BLOCK_LEN)
     return GPG_ERR_CIPHER_ALGO;
+
+  /* SIV uses a fixed 128 bit tag.  Reject truncated or oversized tags
+     before finalizing any state, with an error code that is distinct
+     from an authentication failure.  */
+  if (taglen != GCRY_SIV_BLOCK_LEN)
+    return GPG_ERR_INV_LENGTH;
 
   if (!c->marks.tag)
     {
@@ -361,15 +368,8 @@ _gcry_cipher_siv_check_tag (gcry_cipher_hd_t c, const unsigned char *intag,
       c->marks.tag = 1;
     }
 
-  n = GCRY_SIV_BLOCK_LEN;
-  if (taglen < n)
-    n = taglen;
-
-  if (!buf_eq_const(c->u_mode.siv.s2v_cmac.u_iv.iv, intag, n)
-      || GCRY_SIV_BLOCK_LEN != taglen)
-    {
-      return GPG_ERR_CHECKSUM;
-    }
+  if (!buf_eq_const(c->u_mode.siv.s2v_cmac.u_iv.iv, intag, GCRY_SIV_BLOCK_LEN))
+    return GPG_ERR_CHECKSUM;
 
   return 0;
 }
